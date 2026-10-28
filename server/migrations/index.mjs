@@ -1,0 +1,92 @@
+/**
+ * Small, ordered SQLite schema migrations. Existing V1 databases have user_version=0.
+ * Each migration is atomic; startup refuses an unknown newer schema version.
+ * Back up a production database before deploying a version that changes its schema.
+ */
+const migrations = [
+  // V1: move V1's ad-hoc course column upgrades behind an idempotent migration.
+  database => {
+    const cols = new Set(database.prepare('PRAGMA table_info(course_sessions)').all().map(c => c.name))
+    for (const [name, type] of [['location', 'TEXT'], ['start_at', 'TEXT'], ['end_at', 'TEXT']]) {
+      if (!cols.has(name)) database.exec(`ALTER TABLE course_sessions ADD COLUMN ${name} ${type}`)
+    }
+  },
+  // V2: overlapping typed day-level rules, alongside (not in place of) V1 invalid ranges.
+  database => database.exec(`
+    CREATE TABLE IF NOT EXISTS date_rules (
+      id INTEGER PRIMARY KEY,
+      rule_date TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('PUBLIC_HOLIDAY','MANUAL_INVALID','WEEKEND','VALID_WEEKEND')),
+      source TEXT NOT NULL CHECK(source IN ('AUTO','MANUAL')),
+      reason TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','INACTIVE')),
+      created_by INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(rule_date,type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_date_rules_date_status ON date_rules(rule_date,status);
+  `),
+  // V3: R003 self-drive seat reservation lifecycle and private publisher contact fields.
+  database => {
+    const cols = new Set(database.prepare('PRAGMA table_info(travel_plans)').all().map(c => c.name))
+    if (!cols.has('contact_type')) database.exec('ALTER TABLE travel_plans ADD COLUMN contact_type TEXT')
+    if (!cols.has('contact_value')) database.exec('ALTER TABLE travel_plans ADD COLUMN contact_value TEXT')
+    if (!cols.has('seat_capacity')) database.exec('ALTER TABLE travel_plans ADD COLUMN seat_capacity INTEGER')
+    database.exec(`
+      UPDATE travel_plans
+         SET seat_capacity=seat_count
+       WHERE has_seats=1 AND seat_count IS NOT NULL AND seat_capacity IS NULL;
+      CREATE TABLE IF NOT EXISTS travel_seat_reservations (
+        id INTEGER PRIMARY KEY,
+        travel_plan_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'RESERVED' CHECK(status IN ('RESERVED','CANCELLED')),
+        created_at TEXT NOT NULL,
+        cancelled_at TEXT,
+        FOREIGN KEY(travel_plan_id) REFERENCES travel_plans(id),
+        FOREIGN KEY(user_id) REFERENCES users(id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_seat_reservation
+        ON travel_seat_reservations(travel_plan_id,user_id) WHERE status='RESERVED';
+      CREATE INDEX IF NOT EXISTS idx_seat_reservations_plan_status
+        ON travel_seat_reservations(travel_plan_id,status);
+      CREATE INDEX IF NOT EXISTS idx_seat_reservations_user_status
+        ON travel_seat_reservations(user_id,status);
+    `)
+  },
+  // V4: distinguish self-arranged trips from class-arranged trips; preserve existing plans.
+  database => {
+    const cols = new Set(database.prepare('PRAGMA table_info(travel_plans)').all().map(c => c.name))
+    if (!cols.has('plan_type')) database.exec("ALTER TABLE travel_plans ADD COLUMN plan_type TEXT NOT NULL DEFAULT 'SELF' CHECK(plan_type IN ('SELF','COURSE'))")
+  }
+  ,database => {
+    const cols = new Set(database.prepare('PRAGMA table_info(invalid_date_ranges)').all().map(c => c.name))
+    if (!cols.has('type')) database.exec("ALTER TABLE invalid_date_ranges ADD COLUMN type TEXT NOT NULL DEFAULT 'MANUAL_INVALID'")
+  }
+  ,database => {
+    const cols = new Set(database.prepare('PRAGMA table_info(course_sessions)').all().map(c => c.name))
+    if (!cols.has('instructor')) database.exec("ALTER TABLE course_sessions ADD COLUMN instructor TEXT NOT NULL DEFAULT ''")
+  }
+]
+
+export const SCHEMA_VERSION = migrations.length
+
+export function runMigrations(database) {
+  let version = Number(database.prepare('PRAGMA user_version').get().user_version)
+  if (!Number.isInteger(version) || version < 0 || version > SCHEMA_VERSION) {
+    throw new Error(`不支持数据库版本 ${version}（当前代码最高支持 ${SCHEMA_VERSION}）`)
+  }
+  for (let i = version; i < migrations.length; i++) {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      migrations[i](database)
+      database.exec(`PRAGMA user_version=${i + 1}`)
+      database.exec('COMMIT')
+    } catch (error) {
+      database.exec('ROLLBACK')
+      throw new Error(`数据库迁移 v${i + 1} 失败: ${error.message}`, { cause: error })
+    }
+  }
+  return SCHEMA_VERSION
+}

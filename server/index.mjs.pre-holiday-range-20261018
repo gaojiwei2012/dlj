@@ -1,0 +1,301 @@
+import http from 'node:http'
+import { readFileSync,existsSync } from 'node:fs'
+import { extname,join,resolve } from 'node:path'
+import { randomBytes } from 'node:crypto'
+import { db,hashPassword,verifyPassword } from './db.mjs'
+import { beijingDate,calculateDays,eachDate,validDate } from './date-utils.mjs'
+import { getUserCompliance } from './services/stay-compliance.mjs'
+import { getUserPlanPrediction } from './services/plan-prediction.mjs'
+import { loadYearRuleSources } from './services/year-rule-data.mjs'
+import { makeDateRuleResolver } from './services/date-rules.mjs'
+import { getPlanDateCheck } from './services/plan-date-check.mjs'
+import { decoratePlanSegments } from './services/plan-segments.mjs'
+import { listAdminStudents, getAdminStudentDetail } from './services/admin-students.mjs'
+import { parseManualStay, parseBackfillCheckout } from './services/stay-input.mjs'
+import { getYearDateRuleOverview, syncYearWeekends, createManualDateRule, updateManualDateRule, disableManualDateRule } from './services/date-rule-management.mjs'
+import { SeatReservationError, decorateOwnedPlans, listCompanions, reserveSeat, cancelSeatReservation, validatePlanSeatChange, assertPlanCanDelete } from './services/seat-reservations.mjs'
+
+const port=Number(process.env.PORT||3000), client=resolve('dist/client')
+const validPlanTypes = new Set(['SELF', 'COURSE'])
+const json=(res,status,data)=>{res.writeHead(status,{'content-type':'application/json; charset=utf-8'});res.end(JSON.stringify(data))}
+const csv=(res,name,rows)=>{const esc=v=>'"'+String(v??'').replaceAll('"','""')+'"';const text='\ufeff'+rows.map(r=>r.map(esc).join(',')).join('\r\n');res.writeHead(200,{'content-type':'text/csv; charset=utf-8','content-disposition':`attachment; filename*=UTF-8''${encodeURIComponent(name)}`});res.end(text)}
+const body=async req=>{let s='';for await(const c of req){s+=c;if(s.length>1e6)throw new Error('请求过大')}return s?JSON.parse(s):{}}
+const cookies=req=>Object.fromEntries((req.headers.cookie||'').split(';').filter(Boolean).map(x=>x.trim().split('=')))
+function currentUser(req){const sid=cookies(req).sid;if(!sid)return null;return db.prepare(`SELECT u.id,u.username,u.display_name,u.role,u.status FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.expires_at>? AND u.status='ACTIVE'`).get(sid,new Date().toISOString())||null}
+function auth(req,res){const u=currentUser(req);if(!u){json(res,401,{error:'请先登录'});return null}return u}
+function admin(req,res){const u=auth(req,res);if(!u)return null;if(u.role!=='ADMIN'){json(res,403,{error:'需要管理员权限'});return null}return u}
+function academic(){return db.prepare('SELECT * FROM academic_years WHERE is_current=1').get()}
+function requestedYear(url){const id=url.searchParams.get('yearId');if(id===null)return academic();if(!/^\d+$/.test(id))return null;return db.prepare('SELECT * FROM academic_years WHERE id=?').get(Number(id))||null}
+function stats(userId,y=academic()){const today=beijingDate();const rows=db.prepare("SELECT start_date,COALESCE(end_date,?) end_date FROM stay_records WHERE user_id=? AND deleted_at IS NULL AND status IN ('OPEN','CLOSED')").all(today,userId);const inv=db.prepare("SELECT start_date,end_date FROM invalid_date_ranges WHERE academic_year_id=? AND status='ACTIVE'").all(y.id);inv.push(...db.prepare("SELECT rule_date AS start_date,rule_date AS end_date FROM date_rules WHERE type='MANUAL_INVALID' AND status='ACTIVE' AND rule_date BETWEEN ? AND ?").all(y.start_date,y.end_date));const c=calculateDays(rows,inv,y.start_date,today<y.end_date?today:y.end_date);return {...c,targetDays:y.target_days,remainingDays:Math.max(0,y.target_days-c.effectiveDays),academicYear:y}}
+function invalidRangeError(x,y,exceptId=0){if(!validDate(x.startDate)||!validDate(x.endDate)||x.endDate<x.startDate||x.startDate<y.start_date||x.endDate>y.end_date||!String(x.reason||'').trim())return '无效逗留日期必须位于当前学年内并填写原因';const overlap=db.prepare("SELECT start_date,end_date FROM invalid_date_ranges WHERE academic_year_id=? AND status='ACTIVE' AND id!=? AND start_date<=? AND end_date>=? ORDER BY start_date LIMIT 1").get(y.id,exceptId,x.endDate,x.startDate);
+  if(overlap)return `日期与已添加的 ${overlap.start_date} 至 ${overlap.end_date} 重叠，请修改后再保存`;
+  const single=db.prepare("SELECT rule_date FROM date_rules WHERE type='MANUAL_INVALID' AND status='ACTIVE' AND rule_date BETWEEN ? AND ? LIMIT 1").get(x.startDate,x.endDate);
+  return single?`日期与已添加的 ${single.rule_date} 无效逗留日期重叠，请修改后再保存`:null}
+function courseError(x,y,exceptId=0){
+  const start=x.startAt,end=x.endAt,datetime=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/
+  if(!String(x.title??'').trim())return '请填写课程名称'
+  if(!String(x.location??'').trim())return '请填写上课地点'
+  if(typeof start!=='string'||!datetime.test(start)||!validDate(start.slice(0,10))||Number(start.slice(11,13))>23||Number(start.slice(14,16))>59)return '开始日期或时间不正确，请重新选择'
+  if(typeof end!=='string'||!datetime.test(end)||!validDate(end.slice(0,10))||Number(end.slice(11,13))>23||Number(end.slice(14,16))>59)return '结束日期或时间不正确，请重新选择'
+  if(start>=end)return '课程结束时间必须晚于开始时间'
+  if(start.slice(0,10)<y.start_date||end.slice(0,10)>y.end_date)return `课程日期超出后台当前启用的“${y.name}”范围（${y.start_date} 至 ${y.end_date}）；请检查学年日期或启用正确学年`
+  const overlap=db.prepare("SELECT title,start_at,end_at FROM course_sessions WHERE academic_year_id=? AND status='ACTIVE' AND id!=? AND substr(start_at,1,10)<=? AND substr(end_at,1,10)>=? ORDER BY start_at LIMIT 1").get(y.id,exceptId,end.slice(0,10),start.slice(0,10))
+  return overlap?`课程日期与“${overlap.title}”（${overlap.start_at.slice(0,10)} 至 ${overlap.end_at.slice(0,10)}）重叠，请修改后再保存`:null
+}
+// Edit an existing year without switching which year is active. Stay records and
+// travel plans are date-based, so their statistics are recalculated on next read.
+function updateYear(res,actor,old,x){
+  const name=typeof x.name==='string'?x.name.trim():''
+  const target=Number(x.targetDays)
+  if(!name||name.length>60||!validDate(x.startDate)||!validDate(x.endDate)||x.endDate<x.startDate||!Number.isInteger(target)||target<1)
+    return json(res,400,{error:'请填写有效的学年名称、开始和结束日期以及正整数目标天数'})
+  const overlap=db.prepare('SELECT name,start_date,end_date FROM academic_years WHERE id!=? AND start_date<=? AND end_date>=?').get(old.id,x.endDate,x.startDate)
+  if(overlap)return json(res,409,{error:`学年日期与“${overlap.name}”（${overlap.start_date} 至 ${overlap.end_date}）重叠`})
+  const invalid=db.prepare("SELECT start_date,end_date FROM invalid_date_ranges WHERE academic_year_id=? AND status='ACTIVE' AND (start_date<? OR end_date>?) LIMIT 1").get(old.id,x.startDate,x.endDate)
+  if(invalid)return json(res,409,{error:`已有无效逗留日期（${invalid.start_date} 至 ${invalid.end_date}）超出修改后的学年范围，请先调整该日期`})
+  const manual=db.prepare("SELECT rule_date FROM date_rules WHERE type='MANUAL_INVALID' AND source='MANUAL' AND status='ACTIVE' AND rule_date BETWEEN ? AND ? AND (rule_date<? OR rule_date>?) LIMIT 1").get(old.start_date,old.end_date,x.startDate,x.endDate)
+  if(manual)return json(res,409,{error:`已有无效逗留日期（${manual.rule_date}）超出修改后的学年范围，请先调整该日期`})
+  const course=db.prepare("SELECT title,start_at,end_at FROM course_sessions WHERE academic_year_id=? AND status='ACTIVE' AND (substr(start_at,1,10)<? OR substr(end_at,1,10)>?) LIMIT 1").get(old.id,x.startDate,x.endDate)
+  if(course)return json(res,409,{error:`集中课程“${course.title}”（${course.start_at.slice(0,10)} 至 ${course.end_at.slice(0,10)}）超出修改后的学年范围，请先调整课程日期`})
+  const courseDate=db.prepare("SELECT cd.course_date FROM course_dates cd JOIN course_sessions cs ON cs.id=cd.course_session_id WHERE cs.academic_year_id=? AND cs.status='ACTIVE' AND cd.status='ACTIVE' AND (cd.course_date<? OR cd.course_date>?) LIMIT 1").get(old.id,x.startDate,x.endDate)
+  if(courseDate)return json(res,409,{error:`集中课程日期 ${courseDate.course_date} 超出修改后的学年范围，请先调整课程`})
+  db.prepare('UPDATE academic_years SET name=?,start_date=?,end_date=?,target_days=? WHERE id=?').run(name,x.startDate,x.endDate,target,old.id)
+  const updated=db.prepare('SELECT * FROM academic_years WHERE id=?').get(old.id)
+  audit(actor.id,'UPDATE','academic_year',old.id,old,updated)
+  return json(res,200,{ok:true,academicYear:updated})
+}
+function audit(actor,action,type,id,before,after,reason=''){db.prepare('INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,before_json,after_json,reason,created_at) VALUES(?,?,?,?,?,?,?,?)').run(actor,action,type,id,before?JSON.stringify(before):null,after?JSON.stringify(after):null,reason,new Date().toISOString())}
+async function api(req,res,url){
+  try{
+    if(req.method==='POST'&&url.pathname==='/api/auth/register'){const x=await body(req);if(!x.username||!x.password||!x.displayName||!x.inviteCode||!x.confirmPassword)return json(res,400,{error:'请完整填写注册信息'});if(x.password!==x.confirmPassword)return json(res,400,{error:'两次输入的密码不一致'});if(x.password.length<8)return json(res,400,{error:'密码至少8位'});if(db.prepare('SELECT id FROM users WHERE username=?').get(x.username))return json(res,409,{error:'账号已被使用'});const now=new Date().toISOString();db.exec('BEGIN');try{const code=db.prepare("SELECT * FROM invite_codes WHERE code=? AND status='ACTIVE' AND used_count<max_uses AND (expires_at IS NULL OR expires_at>?)").get(x.inviteCode,now);if(!code){db.exec('ROLLBACK');return json(res,400,{error:'邀请码无效或已用完'})}const r=db.prepare('INSERT INTO users(username,password_hash,display_name,created_at,updated_at) VALUES(?,?,?,?,?)').run(x.username,hashPassword(x.password),x.displayName,now,now);db.prepare('UPDATE invite_codes SET used_count=used_count+1 WHERE id=? AND used_count<max_uses').run(code.id);db.exec('COMMIT');return json(res,201,{id:Number(r.lastInsertRowid)})}catch(e){db.exec('ROLLBACK');throw e}}
+    if(req.method==='POST'&&url.pathname==='/api/auth/login'){const x=await body(req);const u=db.prepare("SELECT * FROM users WHERE username=? AND status='ACTIVE'").get(x.username);if(!u||!verifyPassword(x.password||'',u.password_hash))return json(res,401,{error:'账号或密码错误'});const sid=randomBytes(32).toString('hex'),now=new Date(),exp=new Date(now.getTime()+7*864e5);db.prepare('INSERT INTO sessions(id,user_id,expires_at,created_at) VALUES(?,?,?,?)').run(sid,u.id,exp.toISOString(),now.toISOString());res.setHeader('set-cookie',`sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${process.env.NODE_ENV==='production'?'; Secure':''}`);return json(res,200,{user:{id:u.id,username:u.username,displayName:u.display_name,role:u.role}})}
+    if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const sid=cookies(req).sid;if(sid)db.prepare('DELETE FROM sessions WHERE id=?').run(sid);res.setHeader('set-cookie','sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');return json(res,200,{ok:true})}
+    if(req.method==='GET'&&url.pathname==='/api/auth/me'){const u=auth(req,res);if(u)return json(res,200,{user:{...u,displayName:u.display_name}});return}
+    const u=auth(req,res);if(!u)return
+    if(req.method==='GET'&&url.pathname==='/api/announcement'){return json(res,200,{content:db.prepare('SELECT content FROM site_announcement WHERE id=1').get()?.content||''})}
+    if(req.method==='PATCH'&&url.pathname==='/api/account'){const x=await body(req);const name=String(x.displayName||'').trim();if(!name||name.length>40)return json(res,400,{error:'姓名应为1至40个字符'});const changing=x.newPassword!==undefined||x.confirmPassword!==undefined||x.currentPassword!==undefined;if(changing){const stored=db.prepare('SELECT password_hash FROM users WHERE id=?').get(u.id);if(!x.currentPassword||!verifyPassword(x.currentPassword,stored.password_hash))return json(res,400,{error:'当前密码不正确'});if(!x.newPassword||x.newPassword.length<8)return json(res,400,{error:'新密码至少8位'});if(x.newPassword!==x.confirmPassword)return json(res,400,{error:'两次输入的新密码不一致'})}const now=new Date().toISOString();db.prepare('UPDATE users SET display_name=?,updated_at=? WHERE id=?').run(name,now,u.id);if(changing){db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(x.newPassword),u.id);db.prepare('DELETE FROM sessions WHERE user_id=? AND id!=?').run(u.id,cookies(req).sid)}audit(u.id,'UPDATE','user',u.id,{displayName:u.display_name},{displayName:name,passwordChanged:changing});return json(res,200,{user:{id:u.id,username:u.username,displayName:name,role:u.role}})}
+    if(req.method==='GET'&&url.pathname==='/api/academic-years'){return json(res,200,{years:db.prepare('SELECT id,name,start_date,end_date,target_days,is_current FROM academic_years ORDER BY start_date DESC').all()})}
+    // R001 read-only preview; V1 /api/dashboard and CSV keep their original contract until UI migration.
+    if(req.method==='GET'&&url.pathname==='/api/compliance'){const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'});return json(res,200,{compliance:getUserCompliance(db,u.id,y)})}
+    if(req.method==='GET'&&url.pathname==='/api/dashboard'){const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'});const open=db.prepare("SELECT * FROM stay_records WHERE user_id=? AND status='OPEN' AND deleted_at IS NULL").get(u.id);const asOf=new Date(),ruleSources=loadYearRuleSources(db,y);const compliance=getUserCompliance(db,u.id,y,asOf,ruleSources);return json(res,200,{stats:stats(u.id,y),compliance,planPrediction:getUserPlanPrediction(db,u.id,y,{asOf,compliance,ruleSources}),openStay:open||null})}
+    if(req.method==='POST'&&url.pathname==='/api/stays/check-in'){if(db.prepare("SELECT id FROM stay_records WHERE user_id=? AND status='OPEN' AND deleted_at IS NULL").get(u.id))return json(res,409,{error:'当前已有未签退记录'});const now=new Date().toISOString();db.prepare("INSERT INTO stay_records(user_id,check_in_at,start_date,source,status,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run(u.id,now,beijingDate(now),'CHECK_IN','OPEN',u.id,now,now);return json(res,201,{ok:true})}
+    if(req.method==='POST'&&url.pathname==='/api/stays/check-out'){const r=db.prepare("SELECT * FROM stay_records WHERE user_id=? AND status='OPEN' AND deleted_at IS NULL").get(u.id);if(!r)return json(res,409,{error:'没有待签退记录'});const now=new Date().toISOString();db.prepare("UPDATE stay_records SET check_out_at=?,end_date=?,status='CLOSED',updated_at=? WHERE id=?").run(now,beijingDate(now),now,r.id);return json(res,200,{ok:true})}
+    if(req.method==='POST'&&url.pathname==='/api/stays/check-out/backfill'){
+      const x=await body(req),r=db.prepare("SELECT * FROM stay_records WHERE user_id=? AND status='OPEN' AND deleted_at IS NULL").get(u.id)
+      if(!r)return json(res,409,{error:'没有待签退记录'})
+      let parsed;try{parsed=parseBackfillCheckout(x,r)}catch(e){return json(res,400,{error:e.message})}
+      const now=new Date().toISOString()
+      db.prepare("UPDATE stay_records SET end_date=?,check_out_at=?,status='CLOSED',updated_at=? WHERE id=?").run(parsed.endDate,parsed.checkOutAt,now,r.id)
+      return json(res,200,{ok:true,timeUnknown:parsed.timeUnknown})
+    }
+        if(req.method==='GET'&&url.pathname==='/api/stays'){
+      const filterYear=url.searchParams.has('yearId'),y=filterYear?requestedYear(url):null;
+      if(filterYear&&!y)return json(res,404,{error:'学年不存在'});
+      const today=beijingDate();
+      const rows=filterYear
+        ? db.prepare("SELECT * FROM stay_records WHERE user_id=? AND deleted_at IS NULL AND start_date<=? AND COALESCE(end_date,?)>=? ORDER BY COALESCE(end_date,?) DESC,start_date DESC,id DESC").all(u.id,y.end_date,today,y.start_date,today)
+        : db.prepare("SELECT * FROM stay_records WHERE user_id=? AND deleted_at IS NULL ORDER BY COALESCE(end_date,?) DESC,start_date DESC,id DESC").all(u.id,today);
+      return json(res,200,{records:rows})
+    }
+    if(req.method==='GET'&&url.pathname==='/api/calendar'){
+      const month=url.searchParams.get('month')||beijingDate().slice(0,7)
+      if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month))return json(res,400,{error:'月份格式不正确'})
+      const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'})
+      const from=month+'-01',to=new Date(Date.UTC(Number(month.slice(0,4)),Number(month.slice(5,7)),0)).toISOString().slice(0,10)
+      const rows=db.prepare("SELECT start_date,COALESCE(end_date,?) end_date FROM stay_records WHERE user_id=? AND deleted_at IS NULL AND start_date<=? AND COALESCE(end_date,?)>=?").all(beijingDate(),u.id,to,beijingDate(),from)
+      const scheduled=db.prepare("SELECT cd.course_date FROM course_dates cd JOIN course_sessions cs ON cs.id=cd.course_session_id WHERE cd.status='ACTIVE' AND cs.status='ACTIVE' AND cs.academic_year_id=? AND cd.course_date BETWEEN ? AND ?").all(y.id,from,to)
+      const resolveMonthRule=makeDateRuleResolver(loadYearRuleSources(db,y,from,to))
+      const actual=new Set(),course=new Set(scheduled.map(x=>x.course_date))
+      const presentTo=to<beijingDate()?to:beijingDate()
+      for(const r of rows)if(r.start_date<=presentTo)for(const d of eachDate(r.start_date<from?from:r.start_date,r.end_date>presentTo?presentTo:r.end_date))actual.add(d)
+      const complianceByDate=new Map(getUserCompliance(db,u.id,y).dailyResults.map(day=>[day.date,day]))
+      return json(res,200,{month,days:eachDate(from,to).map(date=>{const inAcademicYear=date>=y.start_date&&date<=y.end_date,rules=resolveMonthRule(date),invalidDate=inAcademicYear&&rules.isManualInvalid,present=actual.has(date),result=complianceByDate.get(date);return {date,inAcademicYear,isPresent:present,isInvalidDate:invalidDate,isInvalid:present&&invalidDate,invalidReason:invalidDate?rules.ruleDetails.filter(r=>r.type==='MANUAL_INVALID').map(r=>r.reason).filter(Boolean).join('；'):null,isCourse:inAcademicYear&&course.has(date),complianceStatus:result?.status??null,stayMinutes:result?.stayMinutes??0,reasonCode:result?.reasonCode??null,ruleDetails:inAcademicYear?rules.ruleDetails:[],provisionalStatus:result?.provisionalStatus??null}})})
+    }
+    if(req.method==='POST'&&url.pathname==='/api/stays'){
+      const x=await body(req);let stay
+      try{stay=parseManualStay(x)}catch(e){return json(res,400,{error:e.message})}
+      const now=new Date().toISOString()
+      db.prepare(`INSERT INTO stay_records(user_id,check_in_at,check_out_at,start_date,end_date,source,status,created_by,created_at,updated_at)
+        VALUES(?,?,?,?,?,'MANUAL','CLOSED',?,?,?)`).run(u.id,stay.checkInAt,stay.checkOutAt,stay.startDate,stay.endDate,u.id,now,now)
+      return json(res,201,{ok:true,timeUnknown:stay.timeUnknown})
+    }
+    const m=url.pathname.match(/^\/api\/stays\/(\d+)$/)
+    if(m&&req.method==='PATCH'){
+      const x=await body(req),old=db.prepare('SELECT * FROM stay_records WHERE id=? AND user_id=? AND deleted_at IS NULL').get(m[1],u.id)
+      if(!old)return json(res,404,{error:'记录不存在'})
+      if(old.status==='OPEN')return json(res,409,{error:'进行中的签到请先签退或使用补签退功能'})
+      let stay;try{stay=parseManualStay(x)}catch(e){return json(res,400,{error:e.message})}
+      // Legacy date-only PATCH for unchanged dates must not destroy already trusted timestamps.
+      // If a date-only client changes the date, old timestamps can no longer prove the new interval.
+      const keepTimes=stay.timeUnknown&&stay.startDate===old.start_date&&stay.endDate===old.end_date
+      db.prepare(`UPDATE stay_records SET start_date=?,end_date=?,check_in_at=?,check_out_at=?,status='CLOSED',updated_at=? WHERE id=?`)
+        .run(stay.startDate,stay.endDate,keepTimes?old.check_in_at:stay.checkInAt,
+          keepTimes?old.check_out_at:stay.checkOutAt,new Date().toISOString(),old.id)
+      return json(res,200,{ok:true,timeUnknown:stay.timeUnknown})
+    }
+        if(m&&req.method==='DELETE'){const old=db.prepare('SELECT id FROM stay_records WHERE id=? AND user_id=? AND deleted_at IS NULL').get(m[1],u.id);if(!old)return json(res,404,{error:'记录不存在'});db.prepare('UPDATE stay_records SET deleted_at=?,updated_at=? WHERE id=?').run(new Date().toISOString(),new Date().toISOString(),old.id);return json(res,200,{ok:true})}
+    if(req.method==='GET'&&url.pathname==='/api/rankings'){const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'});const users=db.prepare("SELECT id,display_name FROM users WHERE status='ACTIVE' ORDER BY display_name,id").all();const rows=users.map(x=>({...x,...stats(x.id,y)})).sort((a,b)=>b.effectiveDays-a.effectiveDays||a.display_name.localeCompare(b.display_name,'zh-CN'));let last=null,rank=0;rows.forEach((x,i)=>{if(x.effectiveDays!==last){rank=i+1;last=x.effectiveDays}x.rank=rank});const visible=u.role==='ADMIN'?rows:rows.slice(0,3);return json(res,200,{rankings:visible.map(x=>({id:x.id,displayName:x.display_name,effectiveDays:x.effectiveDays,actualDays:x.actualDays,invalidDays:x.invalidDays,targetDays:x.targetDays,rank:x.rank,isMe:x.id===u.id}))})}
+    if(req.method==='GET'&&(url.pathname==='/api/courses'||url.pathname==='/api/course-entry')){const sessions=db.prepare("SELECT * FROM course_sessions WHERE academic_year_id=? AND status='ACTIVE' ORDER BY sort_order,id").all(academic().id);const entry=url.pathname==='/api/course-entry';const selected=entry?new Set(db.prepare("SELECT course_date_id FROM course_attendance WHERE user_id=? AND status='ACTIVE'").all(u.id).map(x=>x.course_date_id)):null;for(const s of sessions)s.dates=db.prepare("SELECT id,course_date FROM course_dates WHERE course_session_id=? AND status='ACTIVE' ORDER BY course_date").all(s.id).map(x=>entry?{...x,selected:selected.has(x.id)}:{course_date:x.course_date});return json(res,200,{sessions})}
+    const cm=url.pathname.match(/^\/api\/courses\/(\d+)\/attendance$/);if(cm&&req.method==='PUT'){const x=await body(req),session=db.prepare("SELECT id FROM course_sessions WHERE id=? AND status='ACTIVE'").get(cm[1]);if(!session)return json(res,404,{error:'课程不存在'});const allowed=new Set(db.prepare("SELECT id FROM course_dates WHERE course_session_id=? AND status='ACTIVE'").all(session.id).map(x=>x.id));const ids=[...new Set((x.dateIds||[]).map(Number))];if(ids.some(id=>!allowed.has(id)))return json(res,400,{error:'包含无效课程日期'});db.prepare("UPDATE course_attendance SET status='INACTIVE' WHERE user_id=? AND course_date_id IN (SELECT id FROM course_dates WHERE course_session_id=?)").run(u.id,session.id);const now=new Date().toISOString();for(const id of ids)db.prepare("INSERT INTO course_attendance(user_id,course_date_id,selected_at,status) VALUES(?,?,?,'ACTIVE') ON CONFLICT(user_id,course_date_id) DO UPDATE SET selected_at=excluded.selected_at,status='ACTIVE'").run(u.id,id,now);return json(res,200,{ok:true,stats:stats(u.id)})}
+    // R001 typed date-rule management. ADMIN only; legacy invalid-date API remains intact.
+    if(req.method==='GET'&&url.pathname==='/api/admin/date-rules'){
+      const a=admin(req,res);if(!a)return
+      const year=url.searchParams.get('year')||beijingDate().slice(0,4)
+      try{return json(res,200,getYearDateRuleOverview(db,year))}catch(e){return json(res,e.status||400,{error:e.message})}
+    }
+    if(req.method==='POST'&&url.pathname==='/api/admin/date-rules/sync-weekends'){
+      const a=admin(req,res);if(!a)return
+      try{return json(res,200,syncYearWeekends(db,a.id,(await body(req)).year))}catch(e){return json(res,e.status||400,{error:e.message})}
+    }
+    if(req.method==='POST'&&url.pathname==='/api/admin/date-rules'){
+      const a=admin(req,res);if(!a)return
+      try{return json(res,201,{rule:createManualDateRule(db,a.id,await body(req))})}catch(e){return json(res,e.status||400,{error:e.message})}
+    }
+    const ruleMatch=url.pathname.match(/^\/api\/admin\/date-rules\/(\d+)$/)
+    if(ruleMatch&&(req.method==='PATCH'||req.method==='DELETE')){
+      const a=admin(req,res);if(!a)return
+      try{const rule=req.method==='PATCH'?updateManualDateRule(db,a.id,Number(ruleMatch[1]),await body(req)):
+        disableManualDateRule(db,a.id,Number(ruleMatch[1]));return json(res,200,{rule})}
+      catch(e){return json(res,e.status||400,{error:e.message})}
+    }
+    if(req.method==='GET'&&url.pathname==='/api/admin/config'){const a=admin(req,res);if(!a)return;const y=academic();const invalid=db.prepare("SELECT *, 'RANGE' AS source_type FROM invalid_date_ranges WHERE academic_year_id=? AND status='ACTIVE'").all(y.id);
+      const manualInvalid=db.prepare("SELECT id,rule_date AS start_date,rule_date AS end_date,reason,status,'MANUAL_RULE' AS source_type FROM date_rules WHERE type='MANUAL_INVALID' AND source='MANUAL' AND status='ACTIVE' AND rule_date BETWEEN ? AND ?").all(y.start_date,y.end_date);
+      invalid.push(...manualInvalid);invalid.sort((a,b)=>a.start_date.localeCompare(b.start_date)||a.source_type.localeCompare(b.source_type)||a.id-b.id);const courses=db.prepare('SELECT * FROM course_sessions WHERE academic_year_id=? ORDER BY sort_order,id').all(y.id);for(const c of courses)c.dates=db.prepare('SELECT * FROM course_dates WHERE course_session_id=? ORDER BY course_date').all(c.id);return json(res,200,{academicYear:y,invalidRanges:invalid,courses,announcement:db.prepare('SELECT content FROM site_announcement WHERE id=1').get()?.content||''})}
+    if(req.method==='PUT'&&url.pathname==='/api/admin/announcement'){const a=admin(req,res);if(!a)return;const x=await body(req);if(typeof x.content!=='string'||[...x.content.trim()].length>140)return json(res,400,{error:'公告最多140字'});const content=x.content.trim(),old=db.prepare('SELECT content FROM site_announcement WHERE id=1').get()?.content||'';db.prepare('INSERT INTO site_announcement(id,content,updated_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET content=excluded.content,updated_at=excluded.updated_at').run(content,new Date().toISOString());audit(a.id,'UPDATE','site_announcement',1,{content:old},{content});return json(res,200,{content})}
+    if(req.method==='POST'&&url.pathname==='/api/admin/academic-years'){const a=admin(req,res);if(!a)return;const x=await body(req);if(!validDate(x.startDate)||!validDate(x.endDate)||x.endDate<x.startDate||!Number.isInteger(Number(x.targetDays))||Number(x.targetDays)<1)return json(res,400,{error:'学年配置不正确'});const overlap=db.prepare('SELECT id,name,start_date,end_date FROM academic_years WHERE start_date<=? AND end_date>=?').get(x.endDate,x.startDate);if(overlap)return json(res,409,{error:overlap.start_date===x.startDate&&overlap.end_date===x.endDate?'该学年已存在：'+overlap.name+'，请在学年选择框中切换查看':'学年日期与已有学年 '+overlap.name+' 重叠'});const name=x.startDate.slice(0,4)+'—'+x.endDate.slice(0,4)+'学年';let id;db.exec('BEGIN');try{db.prepare('UPDATE academic_years SET is_current=0 WHERE is_current=1').run();id=Number(db.prepare('INSERT INTO academic_years(name,start_date,end_date,target_days,is_current) VALUES(?,?,?,?,1)').run(name,x.startDate,x.endDate,Number(x.targetDays)).lastInsertRowid);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}audit(a.id,'CREATE','academic_year',id,null,{name,...x});return json(res,201,{id,name})}
+    // Selecting a year in the header changes the viewing scope only. An existing
+    // year must be explicitly activated before current-year admin writes use it.
+    const activateYear=url.pathname.match(/^\/api\/admin\/academic-years\/(\d+)\/activate$/)
+    if(activateYear&&req.method==='PATCH'){
+      const a=admin(req,res);if(!a)return
+      const target=db.prepare('SELECT * FROM academic_years WHERE id=?').get(Number(activateYear[1]))
+      if(!target)return json(res,404,{error:'所选学年不存在'})
+      const previous=academic()
+      if(previous?.id!==target.id){
+        db.exec('BEGIN')
+        try{db.prepare('UPDATE academic_years SET is_current=0 WHERE is_current=1').run();db.prepare('UPDATE academic_years SET is_current=1 WHERE id=?').run(target.id);db.exec('COMMIT')}
+        catch(e){db.exec('ROLLBACK');throw e}
+        audit(a.id,'ACTIVATE','academic_year',target.id,previous,target)
+      }
+      return json(res,200,{ok:true,academicYear:{...target,is_current:1}})
+    }
+    const editYear=url.pathname.match(/^\/api\/admin\/academic-years\/(\d+)$/)
+    if(editYear&&req.method==='PATCH'){
+      const a=admin(req,res);if(!a)return
+      const old=db.prepare('SELECT * FROM academic_years WHERE id=?').get(Number(editYear[1]))
+      if(!old)return json(res,404,{error:'所选学年不存在'})
+      return updateYear(res,a,old,await body(req))
+    }
+    // Preserve the original endpoint for older clients; it only edits the active year.
+    if(req.method==='PUT'&&url.pathname==='/api/admin/academic-year'){
+      const a=admin(req,res);if(!a)return
+      return updateYear(res,a,academic(),await body(req))
+    }
+    if(req.method==='POST'&&url.pathname==='/api/admin/invalid-dates'){const a=admin(req,res);if(!a)return;const x=await body(req),y=academic(),error=invalidRangeError(x,y);if(error)return json(res,error.startsWith('日期与')?409:400,{error});const r=db.prepare("INSERT INTO invalid_date_ranges(academic_year_id,start_date,end_date,reason,status) VALUES(?,?,?,?,'ACTIVE')").run(y.id,x.startDate,x.endDate,String(x.reason).trim());audit(a.id,'CREATE','invalid_date_range',Number(r.lastInsertRowid),null,x);return json(res,201,{ok:true})}
+    const im=url.pathname.match(/^\/api\/admin\/invalid-dates\/(\d+)$/);if(im&&req.method==='PATCH'){const a=admin(req,res);if(!a)return;const old=db.prepare("SELECT * FROM invalid_date_ranges WHERE id=? AND status='ACTIVE'").get(im[1]);if(!old)return json(res,404,{error:'无效逗留日期不存在或已停用'});const x=await body(req),y=academic();if(old.academic_year_id!==y.id)return json(res,409,{error:'只能修改当前学年的无效逗留日期'});const error=invalidRangeError(x,y,old.id);if(error)return json(res,error.startsWith('日期与')?409:400,{error});db.prepare('UPDATE invalid_date_ranges SET start_date=?,end_date=?,reason=? WHERE id=?').run(x.startDate,x.endDate,String(x.reason).trim(),old.id);audit(a.id,'UPDATE','invalid_date_range',old.id,old,x);return json(res,200,{ok:true})}
+    if(im&&req.method==='DELETE'){const a=admin(req,res);if(!a)return;const old=db.prepare("SELECT * FROM invalid_date_ranges WHERE id=? AND status='ACTIVE'").get(im[1]);if(!old)return json(res,404,{error:'配置不存在或已停用'});db.prepare("UPDATE invalid_date_ranges SET status='INACTIVE' WHERE id=?").run(old.id);audit(a.id,'DISABLE','invalid_date_range',old.id,old,{status:'INACTIVE'});return json(res,200,{ok:true})}
+    if(req.method==='POST'&&url.pathname==='/api/admin/courses'){const a=admin(req,res);if(!a)return;const x=await body(req),y=academic(),error=courseError(x,y);if(error)return json(res,error.startsWith('课程日期与')?409:400,{error});const dates=eachDate(x.startAt.slice(0,10),x.endAt.slice(0,10));db.exec('BEGIN');try{const r=db.prepare("INSERT INTO course_sessions(academic_year_id,title,location,start_at,end_at,status,sort_order) VALUES(?,?,?,?,?,'ACTIVE',?)").run(y.id,String(x.title).trim(),String(x.location).trim(),x.startAt,x.endAt,Number(x.sortOrder||0));for(const d of dates)db.prepare("INSERT INTO course_dates(course_session_id,course_date,status) VALUES(?,?,'ACTIVE')").run(r.lastInsertRowid,d);db.exec('COMMIT');audit(a.id,'CREATE','course_session',Number(r.lastInsertRowid),null,x);return json(res,201,{id:Number(r.lastInsertRowid)})}catch(e){db.exec('ROLLBACK');throw e}}
+    const cdm=url.pathname.match(/^\/api\/admin\/courses\/(\d+)$/);if(cdm&&req.method==='DELETE'){const a=admin(req,res);if(!a)return;const old=db.prepare('SELECT * FROM course_sessions WHERE id=?').get(cdm[1]);if(!old)return json(res,404,{error:'课程不存在'});db.prepare("UPDATE course_sessions SET status='INACTIVE' WHERE id=?").run(old.id);audit(a.id,'DISABLE','course_session',old.id,old,{status:'INACTIVE'});return json(res,200,{ok:true})}
+    if(cdm&&req.method==='PATCH'){const a=admin(req,res);if(!a)return;const old=db.prepare("SELECT * FROM course_sessions WHERE id=? AND status='ACTIVE'").get(cdm[1]);if(!old)return json(res,404,{error:'课程不存在或已停用'});const x=await body(req),y=academic();if(old.academic_year_id!==y.id)return json(res,409,{error:'只能修改当前学年的课程'});const error=courseError(x,y,old.id);if(error)return json(res,error.startsWith('课程日期与')?409:400,{error});const dates=new Set(eachDate(x.startAt.slice(0,10),x.endAt.slice(0,10)));db.exec('BEGIN');try{db.prepare('UPDATE course_sessions SET title=?,location=?,start_at=?,end_at=? WHERE id=?').run(String(x.title).trim(),String(x.location).trim(),x.startAt,x.endAt,old.id);const existing=db.prepare('SELECT id,course_date,status FROM course_dates WHERE course_session_id=?').all(old.id);for(const d of existing){if(!dates.has(d.course_date)&&d.status==='ACTIVE'){db.prepare("UPDATE course_dates SET status='INACTIVE' WHERE id=?").run(d.id);db.prepare("UPDATE course_attendance SET status='INACTIVE' WHERE course_date_id=?").run(d.id)}if(dates.has(d.course_date)){if(d.status!=='ACTIVE')db.prepare("UPDATE course_dates SET status='ACTIVE' WHERE id=?").run(d.id);dates.delete(d.course_date)}}for(const d of dates)db.prepare("INSERT INTO course_dates(course_session_id,course_date,status) VALUES(?,?,'ACTIVE')").run(old.id,d);db.exec('COMMIT');audit(a.id,'UPDATE','course_session',old.id,old,x);return json(res,200,{ok:true})}catch(e){db.exec('ROLLBACK');throw e}}
+    // R004 student overview/detail: ADMIN scope, selected academic year, shared R001/R002 engines.
+    if(req.method==='GET'&&url.pathname==='/api/admin/students'){
+      const a=admin(req,res);if(!a)return
+      const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'})
+      return json(res,200,listAdminStudents(db,y,new Date()))
+    }
+    const studentDetailMatch=url.pathname.match(/^\/api\/admin\/students\/(\d+)$/)
+    if(req.method==='GET'&&studentDetailMatch){
+      const a=admin(req,res);if(!a)return
+      const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'})
+      const detail=getAdminStudentDetail(db,Number(studentDetailMatch[1]),y,new Date())
+      if(!detail)return json(res,404,{error:'学生不存在'})
+      return json(res,200,detail)
+    }
+    if(req.method==='GET'&&url.pathname==='/api/admin/users'){const a=admin(req,res);if(!a)return;const users=db.prepare('SELECT id,username,display_name,role,status,created_at FROM users ORDER BY created_at').all();const latest=db.prepare("SELECT id,start_date,end_date,status FROM stay_records WHERE user_id=? AND source='CHECK_IN' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1");return json(res,200,{users:users.map(x=>({...x,stats:stats(x.id),lastCheckIn:latest.get(x.id)||null}))})}
+    const undoMatch=url.pathname.match(/^\/api\/admin\/users\/(\d+)\/undo-check-out$/);if(undoMatch&&req.method==='POST'){const a=admin(req,res);if(!a)return;const target=db.prepare('SELECT id FROM users WHERE id=?').get(undoMatch[1]);if(!target)return json(res,404,{error:'用户不存在'});const old=db.prepare("SELECT * FROM stay_records WHERE user_id=? AND source='CHECK_IN' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1").get(target.id);if(!old||old.status!=='CLOSED')return json(res,409,{error:'该用户没有可撤销的最近一次签退'});if(db.prepare("SELECT id FROM stay_records WHERE user_id=? AND status='OPEN' AND deleted_at IS NULL").get(target.id))return json(res,409,{error:'该用户已有未签退记录'});db.prepare("UPDATE stay_records SET check_out_at=NULL,end_date=NULL,status='OPEN',updated_at=? WHERE id=? AND status='CLOSED'").run(new Date().toISOString(),old.id);audit(a.id,'UNDO_CHECK_OUT','stay_record',old.id,old,{status:'OPEN',endDate:null,checkOutAt:null},'管理员撤销签退');return json(res,200,{ok:true,recordId:old.id})}
+    if(req.method==='GET'&&url.pathname==='/api/admin/invite-codes'){const a=admin(req,res);if(!a)return;return json(res,200,{codes:db.prepare('SELECT * FROM invite_codes ORDER BY id DESC').all()})}
+    if(req.method==='POST'&&url.pathname==='/api/admin/invite-codes'){const a=admin(req,res);if(!a)return;const x=await body(req),uses=Number(x.maxUses??1);if(!Number.isInteger(uses)||uses<1||uses>100)return json(res,400,{error:'使用次数应为1至100'});let code;do{code='MBA-'+randomBytes(6).toString('hex').toUpperCase()}while(db.prepare('SELECT id FROM invite_codes WHERE code=?').get(code));const id=Number(db.prepare("INSERT INTO invite_codes(code,max_uses,status,created_by,created_at) VALUES(?,?,'ACTIVE',?,?)").run(code,uses,a.id,new Date().toISOString()).lastInsertRowid);audit(a.id,'CREATE','invite_code',id,null,{maxUses:uses});return json(res,201,{id,code,maxUses:uses})}
+    const inviteMatch=url.pathname.match(/^\/api\/admin\/invite-codes\/(\d+)$/);if(inviteMatch&&req.method==='PATCH'){const a=admin(req,res);if(!a)return;const old=db.prepare('SELECT * FROM invite_codes WHERE id=?').get(inviteMatch[1]);if(!old)return json(res,404,{error:'邀请码不存在'});db.prepare("UPDATE invite_codes SET status='INACTIVE' WHERE id=?").run(old.id);audit(a.id,'DISABLE','invite_code',old.id,{status:old.status},{status:'INACTIVE'});return json(res,200,{ok:true})}
+    // R002: forecast is academic-year scoped; the legacy list stays unfiltered unless yearId is supplied.
+    // Student-visible preview of administrator date rules, reusing R001 date classification.
+    if(req.method==='GET'&&url.pathname==='/api/travel-plans/date-check'){
+      const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'})
+      const start=url.searchParams.get('startDate'),end=url.searchParams.get('endDate')
+      try{return json(res,200,getPlanDateCheck(db,y,start,end))}
+      catch(e){if(e.status===400)return json(res,400,{error:e.message});throw e}
+    }
+    if(req.method==='GET'&&url.pathname==='/api/travel-plans/prediction'){
+      const y=requestedYear(url);if(!y)return json(res,404,{error:'学年不存在'});
+      return json(res,200,{prediction:getUserPlanPrediction(db,u.id,y)})
+    }
+    // R003 keeps the original travel_plans entity and adds reservation metadata without changing R002's forecast input.
+    if(req.method==='GET'&&url.pathname==='/api/travel-plans'){
+      const filterYear=url.searchParams.has('yearId');const y=filterYear?requestedYear(url):null;
+      if(filterYear&&!y)return json(res,404,{error:'学年不存在'});
+      const plans=filterYear
+        ? db.prepare("SELECT * FROM travel_plans WHERE user_id=? AND status!='DELETED' AND depart_date<=? AND return_date>=? ORDER BY depart_date DESC,id DESC").all(u.id,y.end_date,y.start_date)
+        : db.prepare("SELECT * FROM travel_plans WHERE user_id=? AND status!='DELETED' ORDER BY depart_date DESC,id DESC").all(u.id);
+      return json(res,200,{plans:decoratePlanSegments(db,decorateOwnedPlans(db,plans))})
+    }
+    if(req.method==='POST'&&url.pathname==='/api/travel-plans'){
+      const x=await body(req)
+      if(!validDate(x.departDate)||!validDate(x.returnDate)||x.returnDate<x.departDate)return json(res,400,{error:'出发和返回日期不正确'})
+      const planType=x.planType===undefined?'SELF':x.planType
+      if(!validPlanTypes.has(planType))return json(res,400,{error:'安排方式只能选择自行安排或课程安排'})
+      const isPublic=Boolean(x.isPublic),transport=isPublic?x.transport:null
+      if(isPublic&&(!String(x.city||'').trim()||!['飞机','高铁','轮船','自驾','待定'].includes(transport)))return json(res,400,{error:'公开计划需要填写出发城市和交通方式'})
+      const hasSeats=Boolean(isPublic&&transport==='自驾'&&x.hasSeats),seatCapacity=hasSeats?Number(x.seatCount):null
+      if(hasSeats&&(!Number.isInteger(seatCapacity)||seatCapacity<1||seatCapacity>6))return json(res,400,{error:'可预约座位总数应为1至6'})
+      const contactType=hasSeats?String(x.contactType||'').trim():null,contactValue=hasSeats?String(x.contactValue||'').trim():null
+      if(hasSeats&&!['微信','手机号','其他'].includes(contactType))return json(res,400,{error:'请选择联系方式类型'})
+      if(hasSeats&&(!contactValue||contactValue.length>80))return json(res,400,{error:'请填写80个字符以内的联系方式'})
+      const r=db.prepare("INSERT INTO travel_plans(user_id,depart_date,return_date,plan_type,is_public,city,transport,has_seats,seat_count,seat_capacity,contact_type,contact_value,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'ACTIVE')").run(u.id,x.departDate,x.returnDate,planType,isPublic?1:0,isPublic?String(x.city).trim():null,transport,hasSeats?1:0,seatCapacity,seatCapacity,contactType,contactValue)
+      return json(res,201,{id:Number(r.lastInsertRowid)})
+    }
+    const pm=url.pathname.match(/^\/api\/travel-plans\/(\d+)$/)
+    if(pm&&req.method==='PATCH'){
+      const x=await body(req),old=db.prepare("SELECT * FROM travel_plans WHERE id=? AND user_id=? AND status!='DELETED'").get(pm[1],u.id)
+      if(!old)return json(res,404,{error:'计划不存在'})
+      if(!validDate(x.departDate)||!validDate(x.returnDate)||x.returnDate<x.departDate)return json(res,400,{error:'日期不正确'})
+      const planType=x.planType===undefined?old.plan_type:x.planType
+      if(!validPlanTypes.has(planType))return json(res,400,{error:'安排方式只能选择自行安排或课程安排'})
+      const isPublic=Boolean(x.isPublic),transport=isPublic?x.transport:null
+      if(isPublic&&(!String(x.city||'').trim()||!['飞机','高铁','轮船','自驾','待定'].includes(transport)))return json(res,400,{error:'公开计划信息不完整'})
+      const hasSeats=Boolean(isPublic&&transport==='自驾'&&x.hasSeats),seatCapacity=hasSeats?Number(x.seatCount):null
+      if(hasSeats&&(!Number.isInteger(seatCapacity)||seatCapacity<1||seatCapacity>6))return json(res,400,{error:'可预约座位总数应为1至6'})
+      const contactType=hasSeats?String(x.contactType||'').trim():null,contactValue=hasSeats?String(x.contactValue||'').trim():null
+      if(hasSeats&&!['微信','手机号','其他'].includes(contactType))return json(res,400,{error:'请选择联系方式类型'})
+      if(hasSeats&&(!contactValue||contactValue.length>80))return json(res,400,{error:'请填写80个字符以内的联系方式'})
+      db.exec('BEGIN IMMEDIATE')
+      try{
+        const fresh=db.prepare("SELECT * FROM travel_plans WHERE id=? AND user_id=? AND status!='DELETED'").get(old.id,u.id)
+        const seatState=validatePlanSeatChange(db,fresh,{isPublic,transport,hasSeats,seatCapacity})
+        db.prepare("UPDATE travel_plans SET depart_date=?,return_date=?,plan_type=?,is_public=?,city=?,transport=?,has_seats=?,seat_count=?,seat_capacity=?,contact_type=?,contact_value=? WHERE id=?").run(x.departDate,x.returnDate,planType,isPublic?1:0,isPublic?String(x.city).trim():null,transport,hasSeats?1:0,seatState.remainingSeats,seatCapacity,contactType,contactValue,old.id)
+        db.exec('COMMIT')
+      }catch(e){db.exec('ROLLBACK');throw e}
+      return json(res,200,{ok:true})
+    }
+    if(pm&&req.method==='DELETE'){
+      const old=db.prepare("SELECT id FROM travel_plans WHERE id=? AND user_id=? AND status!='DELETED'").get(pm[1],u.id)
+      if(!old)return json(res,404,{error:'计划不存在'})
+      db.exec('BEGIN IMMEDIATE')
+      try{assertPlanCanDelete(db,old.id);db.prepare("UPDATE travel_plans SET status='DELETED',is_public=0 WHERE id=?").run(old.id);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}
+      return json(res,200,{ok:true})
+    }
+    const reserveMatch=url.pathname.match(/^\/api\/travel-plans\/(\d+)\/reservations$/)
+    if(reserveMatch&&req.method==='POST'){
+      const result=reserveSeat(db,Number(reserveMatch[1]),u.id,beijingDate())
+      return json(res,201,result)
+    }
+    const myReservationMatch=url.pathname.match(/^\/api\/travel-plans\/(\d+)\/reservations\/me$/)
+    if(myReservationMatch&&(req.method==='DELETE'||req.method==='POST')){
+      return json(res,200,cancelSeatReservation(db,Number(myReservationMatch[1]),u.id))
+    }
+    if(req.method==='GET'&&url.pathname==='/api/companions')return json(res,200,{plans:listCompanions(db,u.id,beijingDate())})
+    const um=url.pathname.match(/^\/api\/admin\/users\/(\d+)$/);if(um&&req.method==='PATCH'){const a=admin(req,res);if(!a)return;const x=await body(req),old=db.prepare('SELECT id,username,display_name,role,status FROM users WHERE id=?').get(um[1]);if(!old)return json(res,404,{error:'用户不存在'});if(Number(old.id)===Number(a.id)&&x.status==='DISABLED')return json(res,400,{error:'不能停用当前管理员'});if(Number(old.id)===Number(a.id)&&x.newPassword!==undefined)return json(res,400,{error:'请在账号设置中修改自己的密码'});if(x.newPassword!==undefined&&(!x.newPassword||x.newPassword.length<8||x.newPassword!==x.confirmPassword))return json(res,400,{error:'新密码至少8位且两次输入一致'});const name=x.displayName||old.display_name,status=x.status||old.status;db.prepare('UPDATE users SET display_name=?,status=?,updated_at=? WHERE id=?').run(name,status,new Date().toISOString(),old.id);if(x.newPassword){db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(hashPassword(x.newPassword),new Date().toISOString(),old.id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(old.id)}audit(a.id,'UPDATE','user',old.id,old,{displayName:name,status,passwordReset:Boolean(x.newPassword)},x.reason||'管理员维护');return json(res,200,{ok:true})}
+    if(req.method==='GET'&&url.pathname==='/api/admin/export'){const a=admin(req,res);if(!a)return;const type=url.searchParams.get('type')||'summary';if(type==='details'){const rows=db.prepare("SELECT u.display_name,s.start_date,s.end_date,s.source,s.status FROM stay_records s JOIN users u ON u.id=s.user_id WHERE s.deleted_at IS NULL ORDER BY u.display_name,s.start_date").all();return csv(res,'逗留明细.csv',[['姓名','入澳日期','离澳日期','来源','状态'],...rows.map(x=>[x.display_name,x.start_date,x.end_date,x.source,x.status])])}const users=db.prepare("SELECT id,display_name,username,status FROM users ORDER BY display_name").all();return csv(res,'人员统计.csv',[['姓名','账号','状态','实际在澳','无效天数','有效天数','目标天数','剩余天数'],...users.map(x=>{const s=stats(x.id);return[x.display_name,x.username,x.status,s.actualDays,s.invalidDays,s.effectiveDays,s.targetDays,s.remainingDays]})])}
+    return json(res,404,{error:'接口不存在'})
+  }catch(e){if(e instanceof SeatReservationError)return json(res,e.status,{error:e.message});console.error(e);return json(res,500,{error:'服务暂时不可用'})}
+}
+const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.ico':'image/x-icon','.webmanifest':'application/manifest+json'}
+http.createServer(async(req,res)=>{const url=new URL(req.url,'http://localhost');if(url.pathname==='/health')return json(res,200,{status:'ok',time:new Date().toISOString()});if(url.pathname.startsWith('/api/'))return api(req,res,url);let file=join(client,url.pathname==='/'?'index.html':url.pathname);if(!existsSync(file))file=join(client,'index.html');if(existsSync(file)){res.writeHead(200,{'content-type':types[extname(file)]||'application/octet-stream'});res.end(readFileSync(file))}else{res.writeHead(503);res.end('请先运行 npm run build')}}).listen(port,()=>console.log(`逗留记已启动 http://localhost:${port}`))

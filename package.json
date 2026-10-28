@@ -1,0 +1,22 @@
+{
+  "name": "douliuji",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"node --watch server/index.mjs\" \"vite --host 0.0.0.0\"",
+    "build": "vite build",
+    "start": "node server/index.mjs",
+    "backup": "node server/backup.mjs",
+    "check:production": "node scripts/check-production.mjs",
+    "smoke:production": "node scripts/smoke-production.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "concurrently": "latest",
+    "vite": "latest",
+    "vue": "latest"
+  },
+  "devDependencies": {}
+}
